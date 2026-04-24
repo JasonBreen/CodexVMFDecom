@@ -15,6 +15,7 @@ Limitations:
 from __future__ import annotations
 
 import argparse
+import lzma
 import math
 import re
 import struct
@@ -25,7 +26,6 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 LUMP_ENTITIES = 0
 LUMP_PLANES = 1
 LUMP_TEXDATA = 2
-LUMP_VERTEXES = 3
 LUMP_TEXINFO = 6
 LUMP_TEXDATA_STRING_DATA = 43
 LUMP_TEXDATA_STRING_TABLE = 44
@@ -155,11 +155,48 @@ class BspParser:
             self.lumps.append(LumpInfo(offset, length_, version, fourcc))
             idx += 4
 
+    def _decompress_lzma_lump(self, data: bytes) -> bytes:
+        # Valve LZMA lump header (see Source SDK 2013 public/bspfile.h):
+        # 4 bytes "LZMA", int actualSize, int lzmaSize, 5 bytes properties.
+        if len(data) < 17 or data[:4] != b"LZMA":
+            return data
+
+        actual_size, lzma_size = struct.unpack_from("<ii", data, 4)
+        props = data[12:17]
+        payload = data[17 : 17 + max(0, lzma_size)]
+        if len(payload) != max(0, lzma_size):
+            raise ValueError("Invalid LZMA lump payload length")
+
+        prop0 = props[0]
+        lc = prop0 % 9
+        rest = prop0 // 9
+        lp = rest % 5
+        pb = rest // 5
+        dict_size = int.from_bytes(props[1:5], "little", signed=False)
+
+        filters = [
+            {
+                "id": lzma.FILTER_LZMA1,
+                "dict_size": max(4096, dict_size),
+                "lc": lc,
+                "lp": lp,
+                "pb": pb,
+            }
+        ]
+
+        out = lzma.decompress(payload, format=lzma.FORMAT_RAW, filters=filters)
+        if actual_size >= 0 and len(out) != actual_size:
+            raise ValueError("LZMA lump decompressed size mismatch")
+        return out
+
     def read_lump(self, lump_id: int) -> bytes:
         info = self.lumps[lump_id]
         if info.offset < 0 or info.length < 0 or info.offset + info.length > len(self.data):
             raise ValueError(f"Invalid lump bounds for lump {lump_id}")
-        return self.data[info.offset : info.offset + info.length]
+        raw = self.data[info.offset : info.offset + info.length]
+        if raw[:4] == b"LZMA":
+            return self._decompress_lzma_lump(raw)
+        return raw
 
 
 def parse_planes(data: bytes) -> List[Plane]:
@@ -220,11 +257,25 @@ def parse_brushes(data: bytes) -> List[Brush]:
 
 
 def parse_brushsides(data: bytes) -> List[BrushSide]:
-    fmt = "<HhHbb"
+    # Source SDK 2013 dbrushside_t is 8 bytes: unsigned short, short, short, short.
+    # Some later branches add fields. Detect by stride from lump length.
+    if len(data) % 8 == 0:
+        fmt = "<Hhhh"
+    elif len(data) % 6 == 0:
+        # Older/non-standard variants seen in some branches/tools.
+        fmt = "<HhHbb"
+    else:
+        raise ValueError(f"Unsupported brushside lump size {len(data)}")
+
     sz = struct.calcsize(fmt)
     out: List[BrushSide] = []
     for i in range(0, len(data), sz):
-        plane_num, texinfo, dispinfo, bevel, thin = struct.unpack_from(fmt, data, i)
+        vals = struct.unpack_from(fmt, data, i)
+        if sz == 8:
+            plane_num, texinfo, dispinfo, bevel = vals
+            thin = 0
+        else:
+            plane_num, texinfo, dispinfo, bevel, thin = vals
         out.append(BrushSide(plane_num, texinfo, dispinfo, bevel, thin))
     return out
 
@@ -376,7 +427,16 @@ def decompile(bsp_path: Path, vmf_path: Path) -> None:
         end = str_data.find(b"\x00", ofs)
         if end == -1:
             end = len(str_data)
-        tex_names.append(str_data[ofs:end].decode("utf-8", errors="replace").upper())
+        tex_names.append(str_data[ofs:end].decode("utf-8", errors="replace"))
+
+    cubemap_fixup_re = re.compile(r"^maps/[^/]+/(.+?)(?:_-?\d+_-?\d+_-?\d+)?$", re.IGNORECASE)
+
+    def normalize_material(name: str) -> str:
+        n = name.strip().replace("\\", "/")
+        m = cubemap_fixup_re.match(n)
+        if m:
+            n = m.group(1)
+        return n or "TOOLS/TOOLSNODRAW"
 
     def get_material(side: BrushSide) -> str:
         if side.texinfo < 0 or side.texinfo >= len(texinfo):
@@ -387,7 +447,7 @@ def decompile(bsp_path: Path, vmf_path: Path) -> None:
         td = texdata[ti.texdata]
         if td.name_id < 0 or td.name_id >= len(tex_names):
             return "TOOLS/TOOLSNODRAW"
-        return tex_names[td.name_id] or "TOOLS/TOOLSNODRAW"
+        return normalize_material(tex_names[td.name_id])
 
     lines: List[str] = []
     lines.append("versioninfo")
